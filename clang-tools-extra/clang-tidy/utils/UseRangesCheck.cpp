@@ -160,6 +160,26 @@ void UseRangesCheck::registerMatchers(MatchFinder *Finder) {
   }
 }
 
+// Use Lexer to find the actual comma token rather than relying on fixed
+// character offsets, which are brittle and fail when source code
+// formatting (e.g., whitespace, comments) varies.
+static SourceLocation findCommaAfter(const Expr *PrevArg,
+                                     const ASTContext &Ctx) {
+  const SourceManager &SM = Ctx.getSourceManager();
+  const LangOptions &LangOpts = Ctx.getLangOpts();
+  SourceLocation Loc =
+      Lexer::getLocForEndOfToken(PrevArg->getEndLoc(), 0, SM, LangOpts);
+  Token Tok;
+  while (!Lexer::getRawToken(Loc, Tok, SM, LangOpts)) {
+    if (Tok.is(tok::comma))
+      return Tok.getLocation();
+    if (Tok.is(tok::eof))
+      break;
+    Loc = Tok.getEndLoc();
+  }
+  return {};
+}
+
 static void removeFunctionArgs(const DiagnosticBuilder &Diag,
                                const CallExpr &Call, ArrayRef<unsigned> Indexes,
                                const ASTContext &Ctx) {
@@ -172,20 +192,26 @@ static void removeFunctionArgs(const DiagnosticBuilder &Diag,
   for (const unsigned Index : Sorted) {
     const Expr *Arg = Call.getArg(Index);
     if (Commas[Index]) {
-      if (Index >= Commas.size()) {
+      // Find the comma after Arg
+      SourceLocation CommaLoc = findCommaAfter(Arg, Ctx);
+      if (CommaLoc.isInvalid()) {
         Diag << FixItHint::CreateRemoval(Arg->getSourceRange());
       } else {
         // Remove the next comma
-        Commas[Index + 1] = true;
-        Diag << FixItHint::CreateRemoval(CharSourceRange::getTokenRange(
-            {Arg->getBeginLoc(),
-             Lexer::getLocForEndOfToken(
-                 Arg->getEndLoc(), 0, Ctx.getSourceManager(), Ctx.getLangOpts())
-                 .getLocWithOffset(1)}));
+        if (Index + 1 < Commas.size())
+          Commas[Index + 1] = true;
+        Diag << FixItHint::CreateRemoval(
+            CharSourceRange::getTokenRange(Arg->getBeginLoc(), CommaLoc));
       }
     } else {
-      Diag << FixItHint::CreateRemoval(CharSourceRange::getTokenRange(
-          Arg->getBeginLoc().getLocWithOffset(-1), Arg->getEndLoc()));
+      assert(Index > 0);
+      SourceLocation CommaLoc = findCommaAfter(Call.getArg(Index - 1), Ctx);
+      if (CommaLoc.isInvalid()) {
+        Diag << FixItHint::CreateRemoval(Arg->getSourceRange());
+      } else {
+        Diag << FixItHint::CreateRemoval(
+            CharSourceRange::getTokenRange(CommaLoc, Arg->getEndLoc()));
+      }
       Commas[Index] = true;
     }
   }
